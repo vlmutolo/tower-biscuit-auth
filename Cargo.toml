@@ -12,3 +12,7 @@ tower = { version = "0.4.12", default-features = false, features = ["filter"] }
 [[example]]
 name = "basic_read"
 path = "examples/basic_read.rs"
+
+[dev-dependencies]
+hex = "0.4.3"
+hyper = { version = "0.14.18", features = ["tcp", "http1", "server"] }
