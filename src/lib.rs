@@ -8,6 +8,18 @@ pub struct BiscuitAuth {
     auth_info: Arc<ArcSwap<AuthInfo>>,
 }
 
+impl BiscuitAuth {
+    pub fn new(auth_info: AuthInfo) -> Self {
+        Self {
+            auth_info: Arc::new(ArcSwap::from_pointee(auth_info)),
+        }
+    }
+
+    pub fn update(&self, auth_info: AuthInfo) {
+        self.auth_info.store(Arc::new(auth_info))
+    }
+}
+
 type TowerError = tower::BoxError;
 
 impl<Request> tower::filter::Predicate<Request> for BiscuitAuth
@@ -102,6 +114,6 @@ impl AuthInfo {
     }
 
     fn biscuit(&self, token: &[u8]) -> Result<Biscuit, Token> {
-        Ok(Biscuit::from(token, |_| self.root_pubkeys)?)
+        Biscuit::from(token, |_| self.root_pubkeys)
     }
 }
