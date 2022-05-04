@@ -3,63 +3,105 @@ use std::{fmt, sync::Arc};
 
 use biscuit_auth::{error::Token, Authorizer, Biscuit, PublicKey};
 
-pub trait RequestExtract<R> {
-    fn extract(&self, request: &R, authorizer: &mut Authorizer) -> Result<(), Token>;
-}
-
-#[derive(Debug, Clone)]
-pub struct BiscuitAuth<Extractor> {
+#[derive(Clone)]
+pub struct BiscuitAuth {
     auth_info: Arc<ArcSwap<AuthInfo>>,
-    extractor: Extractor,
 }
 
-impl<Request, Extractor> tower::filter::Predicate<Request> for BiscuitAuth<Extractor>
+type TowerError = tower::BoxError;
+
+impl<Request> tower::filter::Predicate<Request> for BiscuitAuth
 where
-    Request: AuthToken,
+    Request: AuthExtract,
 {
     type Request = Request;
 
-    fn check(&mut self, request: Request) -> Result<Self::Request, tower::BoxError> {
-        let biscuit = {
-            let auth_info_guard: arc_swap::Guard<_, _> = self.auth_info.load();
-            let auth_info: &AuthInfo = &auth_info_guard;
-            Biscuit::from(request.auth_token(), |_root_id| *auth_info.root_pubkey())?
+    fn check(&mut self, request: Request) -> Result<Self::Request, TowerError> {
+        let auth_info_guard: arc_swap::Guard<_, _> = self.auth_info.load();
+        let auth_info: &AuthInfo = &auth_info_guard;
+
+        // We play some weird error-handling games here so that we don't
+        // accidentally emit sensitive information in errors, which are
+        // likely to end up in logs somewhere.
+        let try_auth = || -> Result<(), Token> {
+            let biscuit = auth_info.biscuit(request.auth_token())?;
+
+            let mut authorizer = auth_info.authorizer.clone();
+            authorizer.add_token(&biscuit)?;
+
+            request.extract_context(&mut authorizer)?;
+
+            authorizer.authorize()?;
+
+            Ok(())
         };
 
-        let mut authorizer = Authorizer::new()?;
-        self.extractor.extract(&request, &mut authorizer)?;
-        authorizer.add_token(&biscuit)?;
+        try_auth().map_err(|token| {
+            let error_context = match auth_info.error_mode {
+                ErrorMode::Secure => None,
+                ErrorMode::Verbose => Some(token),
+            };
+            BiscuitAuthError(error_context)
+        })?;
 
         Ok(request)
     }
 }
 
-// TODO: Store more info here? Maybe the reason for failure?
-#[derive(Clone, Debug)]
-pub struct BiscuitAuthError;
+#[derive(Debug)]
+pub struct BiscuitAuthError(Option<Token>);
 
 impl fmt::Display for BiscuitAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("couldn't authorize biscuit")
+        f.write_str("failed to authorize request")
     }
 }
 
-pub trait AuthToken {
-    fn auth_token(&self) -> &[u8];
+impl std::error::Error for BiscuitAuthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // TODO: There has to be a better way to do this. It's not
+        // wrong. It's just dumb.
+        match &self.0 {
+            Some(e) => Some(e),
+            None => None,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug)]
+pub enum ErrorMode {
+    Secure,
+    Verbose,
+}
+
+pub trait AuthExtract {
+    fn auth_token(&self) -> &[u8];
+
+    /// Use the information in the request to add any relevant infoformation
+    /// to the authorizer, such as if the request is a read or write request,
+    /// or the specific resource the request is trying to access.
+    fn extract_context(&self, _authorizer: &mut Authorizer) -> Result<(), Token> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct AuthInfo {
     root_pubkeys: PublicKey,
-    authorizor_serialized: Box<[u8]>,
+    authorizer: Authorizer<'static>,
+    error_mode: ErrorMode,
 }
 
 impl AuthInfo {
-    fn root_pubkey(&self) -> &PublicKey {
-        &self.root_pubkeys
+    pub fn new(pubkey: PublicKey, authorizer: Authorizer<'static>, error_mode: ErrorMode) -> Self {
+        Self {
+            root_pubkeys: pubkey,
+            authorizer,
+            error_mode,
+        }
     }
 
-    fn authorizer_serialized(&self) -> &[u8] {
-        &self.authorizor_serialized
+    fn biscuit(&self, token: &[u8]) -> Result<Biscuit, Token> {
+        Ok(Biscuit::from(token, |_| self.root_pubkeys)?)
     }
 }
