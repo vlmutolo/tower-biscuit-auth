@@ -18,17 +18,11 @@ impl BiscuitAuth {
     pub fn update(&self, auth_info: AuthInfo) {
         self.auth_info.store(Arc::new(auth_info))
     }
-}
 
-type TowerError = tower::BoxError;
-
-impl<Request> tower::filter::Predicate<Request> for BiscuitAuth
-where
-    Request: AuthExtract,
-{
-    type Request = Request;
-
-    fn check(&mut self, request: Request) -> Result<Self::Request, TowerError> {
+    pub fn check<R>(&self, request: &R) -> Result<(), BiscuitAuthError>
+    where
+        R: AuthExtract,
+    {
         let auth_info_guard: arc_swap::Guard<_, _> = self.auth_info.load();
         let auth_info: &AuthInfo = &auth_info_guard;
 
@@ -54,8 +48,20 @@ where
                 ErrorMode::Verbose => Some(token),
             };
             BiscuitAuthError(error_context)
-        })?;
+        })
+    }
+}
 
+type TowerError = tower::BoxError;
+
+impl<Request> tower::filter::Predicate<Request> for BiscuitAuth
+where
+    Request: AuthExtract,
+{
+    type Request = Request;
+
+    fn check(&mut self, request: Request) -> Result<Self::Request, TowerError> {
+        BiscuitAuth::check(self, &request)?;
         Ok(request)
     }
 }
