@@ -1,17 +1,19 @@
 use arc_swap::ArcSwap;
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use biscuit_auth::{error::Token, Authorizer, Biscuit, PublicKey};
 
 #[derive(Clone)]
-pub struct BiscuitAuth {
+pub struct BiscuitAuth<E> {
     auth_info: Arc<ArcSwap<AuthInfo>>,
+    extractor: E,
 }
 
-impl BiscuitAuth {
-    pub fn new(auth_info: AuthInfo) -> Self {
+impl<E> BiscuitAuth<E> {
+    pub fn new(auth_info: AuthInfo, extractor: E) -> Self {
         Self {
             auth_info: Arc::new(ArcSwap::from_pointee(auth_info)),
+            extractor,
         }
     }
 
@@ -19,9 +21,13 @@ impl BiscuitAuth {
         self.auth_info.store(Arc::new(auth_info))
     }
 
-    pub fn check<R>(&self, request: &R) -> Result<(), BiscuitAuthError>
+    pub fn to_auth_info(&self) -> AuthInfo {
+        self.auth_info.load().as_ref().clone()
+    }
+
+    pub fn check<R>(&self, request: &R, extractor: &E) -> Result<(), BiscuitAuthError>
     where
-        R: AuthExtract,
+        E: AuthExtract<Request = R>,
     {
         let auth_info_guard: arc_swap::Guard<_, _> = self.auth_info.load();
         let auth_info: &AuthInfo = &auth_info_guard;
@@ -30,12 +36,12 @@ impl BiscuitAuth {
         // accidentally emit sensitive information in errors, which are
         // likely to end up in logs somewhere.
         let try_auth = || -> Result<(), Token> {
-            let biscuit = auth_info.biscuit(request.auth_token())?;
+            let biscuit = auth_info.biscuit(&extractor.auth_token(request))?;
 
             let mut authorizer = auth_info.authorizer.clone();
             authorizer.add_token(&biscuit)?;
 
-            request.extract_context(&mut authorizer)?;
+            extractor.extract_context(request, &mut authorizer)?;
 
             authorizer.authorize()?;
 
@@ -54,20 +60,26 @@ impl BiscuitAuth {
 
 type TowerError = tower::BoxError;
 
-impl<Request> tower::filter::Predicate<Request> for BiscuitAuth
+impl<Request, Extract> tower::filter::Predicate<Request> for BiscuitAuth<Extract>
 where
-    Request: AuthExtract,
+    Extract: AuthExtract<Request = Request>,
 {
     type Request = Request;
 
     fn check(&mut self, request: Request) -> Result<Self::Request, TowerError> {
-        BiscuitAuth::check(self, &request)?;
+        BiscuitAuth::check(self, &request, &self.extractor)?;
         Ok(request)
     }
 }
 
 #[derive(Debug)]
 pub struct BiscuitAuthError(Option<Token>);
+
+impl BiscuitAuthError {
+    pub fn token(&self) -> Option<&Token> {
+        self.0.as_ref()
+    }
+}
 
 impl fmt::Display for BiscuitAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -93,25 +105,47 @@ pub enum ErrorMode {
 }
 
 pub trait AuthExtract {
-    fn auth_token(&self) -> &[u8];
+    type Request;
+
+    /// How to find the
+    fn auth_token(&self, req: &Self::Request) -> Vec<u8>;
 
     /// Use the information in the request to add any relevant infoformation
     /// to the authorizer, such as if the request is a read or write request,
     /// or the specific resource the request is trying to access.
-    fn extract_context(&self, _authorizer: &mut Authorizer) -> Result<(), Token> {
+    fn extract_context(
+        &self,
+        _req: &Self::Request,
+        _authorizer: &mut Authorizer,
+    ) -> Result<(), Token> {
         Ok(())
     }
 }
 
 #[derive(Clone)]
+pub struct PubKeys {
+    base: PublicKey,
+    by_id: BTreeMap<u32, PublicKey>,
+}
+
+impl PubKeys {
+    pub fn new(base: PublicKey) -> Self {
+        Self {
+            base,
+            by_id: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AuthInfo {
-    root_pubkeys: PublicKey,
-    authorizer: Authorizer<'static>,
-    error_mode: ErrorMode,
+    pub root_pubkeys: PubKeys,
+    pub authorizer: Authorizer<'static>,
+    pub error_mode: ErrorMode,
 }
 
 impl AuthInfo {
-    pub fn new(pubkey: PublicKey, authorizer: Authorizer<'static>, error_mode: ErrorMode) -> Self {
+    pub fn new(pubkey: PubKeys, authorizer: Authorizer<'static>, error_mode: ErrorMode) -> Self {
         Self {
             root_pubkeys: pubkey,
             authorizer,
@@ -120,6 +154,18 @@ impl AuthInfo {
     }
 
     fn biscuit(&self, token: &[u8]) -> Result<Biscuit, Token> {
-        Biscuit::from(token, |_| self.root_pubkeys)
+        Biscuit::from(token, |id| self.pubkey_by_id(id))
+    }
+
+    fn pubkey_by_id(&self, id: Option<u32>) -> PublicKey {
+        match id {
+            None => self.root_pubkeys.base,
+            Some(id) => self
+                .root_pubkeys
+                .by_id
+                .get(&id)
+                .copied()
+                .unwrap_or(self.root_pubkeys.base),
+        }
     }
 }
