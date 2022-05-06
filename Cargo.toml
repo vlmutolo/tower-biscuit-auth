@@ -8,7 +8,7 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/vlmutolo/tower-biscuit-auth"
 homepage = "https://github.com/vlmutolo/tower-biscuit-auth"
-categories = ["network-programming", "authorization", "tower", "biscuits"]
+categories = ["network-programming", "web-programming", "authentication", "cryptography"]
 
 description = "Integrating Biscuit authentication with the Tower ecosystem."
 
