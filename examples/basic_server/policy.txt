@@ -1,0 +1,3 @@
+admin("alice");
+admin("bob");
+allow if user($username), admin($username);

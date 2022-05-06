@@ -4,12 +4,12 @@ use tower::filter::Filter;
 use tower_test::{assert_request_eq, mock};
 
 use tower_biscuit_auth::{
-    AuthExtract, AuthInfo, BiscuitAuth, BiscuitAuthError, ErrorMode, PubKeys,
+    AuthConfig, AuthExtract, BiscuitAuth, BiscuitAuthError, ErrorMode, RootKeys,
 };
 
-fn gen_test_auth_info(error_mode: ErrorMode) -> AuthInfo {
+fn gen_test_auth_info(error_mode: ErrorMode) -> AuthConfig {
     let pubkey: PublicKey = keys().public();
-    let pubkeys: PubKeys = PubKeys::new(pubkey);
+    let pubkeys: RootKeys = RootKeys::new(pubkey);
 
     let mut authorizer = Authorizer::new().unwrap();
 
@@ -18,7 +18,7 @@ fn gen_test_auth_info(error_mode: ErrorMode) -> AuthInfo {
 
     authorizer.add_code(policy).unwrap();
 
-    AuthInfo::new(pubkeys, authorizer, error_mode)
+    AuthConfig::new(pubkeys, authorizer, error_mode)
 }
 
 fn keys() -> KeyPair {
@@ -35,18 +35,18 @@ struct Extractor;
 impl AuthExtract for Extractor {
     type Request = Request;
 
-    fn auth_token(&self, req: &Self::Request) -> Vec<u8> {
+    fn auth_token(&self, req: &Self::Request) -> Result<Vec<u8>, BiscuitAuthError> {
         let keypair = keys();
 
         let mut builder = Biscuit::builder(&keypair);
-        builder.add_authority_fact(r#"right("read")"#).unwrap();
+        builder.add_authority_fact(r#"right("read")"#)?;
 
         if let Request(0) = req {
-            builder.add_authority_fact(r#"right("write")"#).unwrap();
+            builder.add_authority_fact(r#"right("write")"#)?;
         }
 
-        let biscuit = builder.build().unwrap();
-        biscuit.to_vec().unwrap()
+        let biscuit = builder.build()?;
+        Ok(biscuit.to_vec()?)
     }
 }
 
@@ -80,7 +80,7 @@ async fn simple_request_denied_with_context() {
 
     let error = response.unwrap_err();
     let error: Box<BiscuitAuthError> = error.downcast().unwrap();
-    assert!(error.token().is_some());
+    assert!(error.failure_info().is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -97,7 +97,7 @@ async fn simple_request_denied_no_context() {
 
     let error = response.unwrap_err();
     let error: Box<BiscuitAuthError> = error.downcast().unwrap();
-    assert!(error.token().is_none());
+    assert!(error.failure_info().is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -117,7 +117,7 @@ async fn dynamic_policy_change() {
     let error: Box<BiscuitAuthError> = error.downcast().unwrap();
 
     // This error doesn't contain any failure info.
-    assert!(error.token().is_none());
+    assert!(error.failure_info().is_none());
 
     // Change the policy to ErrorMode::Verbose.
     let mut new_auth_info = biscuit_auth.to_auth_info();
@@ -130,5 +130,5 @@ async fn dynamic_policy_change() {
     let error: Box<BiscuitAuthError> = error.downcast().unwrap();
 
     // The new error contains the verification failure info.
-    assert!(error.token().is_some());
+    assert!(error.failure_info().is_some());
 }

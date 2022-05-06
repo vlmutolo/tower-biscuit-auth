@@ -10,13 +10,14 @@ arc-swap = "1.5.0"
 biscuit-auth = "2.1.0"
 tower = { version = "0.4.12", default-features = false, features = ["filter"] }
 
-[[example]]
-name = "basic_read"
-path = "examples/basic_read.rs"
-
 [dev-dependencies]
-hex = "0.4.3"
-hyper = { version = "0.14.18", features = ["tcp", "http1", "server"] }
+axum = "0.5.4"
 tokio = { version = "1.18.1", features = ["macros"] }
+hyper = { version = "0.14.18", features = ["tcp", "http1", "server"] }
+tower-http = { version = "0.3.2", features = ["auth"] }
+http = { version = "0.2.7" }
 tokio-test = "0.4.2"
 tower-test = "0.4.0"
+anyhow = "1.0.57"
+base64 = "0.13.0"
+hex = "0.4.3"
