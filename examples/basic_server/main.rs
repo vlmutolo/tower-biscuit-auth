@@ -1,5 +1,9 @@
 use axum::{
-    body::Body, error_handling::HandleErrorLayer, extract::Path, routing::get, Router, Server,
+    body::Body,
+    error_handling::HandleErrorLayer,
+    extract::Path,
+    routing::{get, post},
+    Router, Server,
 };
 use base64::URL_SAFE;
 use biscuit_auth::{Authorizer, PublicKey};
@@ -17,12 +21,23 @@ fn main() {
 
     let _rt_guard = rt.enter();
 
-    let biscuit_auth = load_auth();
-    let auth_layer = Filter::<Request<Body>, BiscuitAuth<_>>::layer(biscuit_auth);
+    let biscuit_auth = load_auth(None);
+    let auth_layer = Filter::<Request<Body>, BiscuitAuth<_>>::layer(biscuit_auth.clone());
 
     let app: Router<Body> = Router::new()
         // This route is public.
         .route("/", get(|| async { "Hello, World!" }))
+        // This route makes the server reload its authentication config.
+        .route(
+            "/auth/reload",
+            post({
+                let biscuit_auth = biscuit_auth.clone();
+                move || async {
+                    let _ = load_auth(Some(biscuit_auth));
+                    "Reloaded auth."
+                }
+            }),
+        )
         // This one requires a biscuit with an authority fact
         // indicating that the bearer is "user($user_id)".
         .route(
@@ -50,21 +65,34 @@ async fn handle_auth_error(err: tower::BoxError) -> (StatusCode, String) {
     }
 }
 
-fn load_auth() -> BiscuitAuth<AuthCookieExtractor> {
-    let pubkey: Vec<u8> = hex::decode(include_str!("public.key").trim()).unwrap();
+fn load_auth(
+    old_auth: Option<BiscuitAuth<AuthCookieExtractor>>,
+) -> BiscuitAuth<AuthCookieExtractor> {
+    let pubkey: String = std::fs::read_to_string("assets/public.key").unwrap();
+    let pubkey: Vec<u8> = hex::decode(pubkey.trim()).unwrap();
     let pubkey = PublicKey::from_bytes(&pubkey).unwrap();
     let root_keys = RootKeys::new(pubkey);
 
     let mut authorizer = Authorizer::new().unwrap();
 
-    authorizer.add_code(include_str!("policy.txt")).unwrap();
+    let policy = std::fs::read_to_string("assets/policy.txt").unwrap();
+    authorizer.add_code(&policy).unwrap();
 
     // WARNING: You probably don't want to use ErrorMode::Verbose in production.
     // It can give attackers more information about the system they're trying to
     // break. Prefer ErrorMode::Secure instead.
-    let auth_info = AuthConfig::new(root_keys, authorizer, ErrorMode::Verbose);
+    let auth_config = AuthConfig::new(root_keys, authorizer, ErrorMode::Verbose);
 
-    BiscuitAuth::new(auth_info, AuthCookieExtractor)
+    // If we're passed in an existing `BiscuitAuth<_>`, we should update it
+    // instead of returning a new one. This way, the rest of the endpoints
+    // already using the existing `BiscuitAuth` actually get the new information.
+    match old_auth {
+        None => BiscuitAuth::new(auth_config, AuthCookieExtractor),
+        Some(old_auth) => {
+            old_auth.update(auth_config);
+            old_auth
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
