@@ -3,70 +3,92 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use biscuit_auth::{error::Token, Authorizer, Biscuit, PublicKey};
 
-// mod http;
+pub use auth_handles::AuthHandles;
 
-#[derive(Clone)]
-pub struct BiscuitAuth<E> {
-    auth_info: Arc<ArcSwap<AuthConfig>>,
-    extractor: E,
+mod auth_handles;
+
+// TODO: We can probably provide our own "Extension" extractor type so
+// that the user just has to add the `tower_biscuit_auth::PassToken` to a
+// handler for protection. Then if that function is ever entered, we know
+// that the extractor successfully parsed and authorized the request.
+
+#[cfg(feature = "http")]
+pub mod http;
+
+type TowerError = tower::BoxError;
+
+#[derive(Clone, Debug)]
+pub struct SharedAuth {
+    auth_config: Arc<ArcSwap<AuthConfig>>,
 }
 
-impl<E> BiscuitAuth<E> {
-    pub fn new(auth_info: AuthConfig, extractor: E) -> Self {
+impl SharedAuth {
+    pub fn new(auth_info: AuthConfig) -> Self {
         Self {
-            auth_info: Arc::new(ArcSwap::from_pointee(auth_info)),
-            extractor,
+            auth_config: Arc::new(ArcSwap::from_pointee(auth_info)),
         }
     }
 
     pub fn update(&self, auth_info: AuthConfig) {
-        self.auth_info.store(Arc::new(auth_info))
+        self.auth_config.store(Arc::new(auth_info))
     }
 
     pub fn to_auth_info(&self) -> AuthConfig {
-        self.auth_info.load().as_ref().clone()
+        self.auth_config.load().as_ref().clone()
     }
 
-    pub fn check<R>(&self, request: &R, extractor: &E) -> Result<(), BiscuitAuthError>
+    pub fn into_predicate<E>(self, extractor: E) -> AuthPredicate<E> {
+        AuthPredicate {
+            shared_auth: self.clone(),
+            extractor,
+        }
+    }
+
+    pub fn check<R, E>(&self, request: &R, extractor: &E) -> Result<(), BiscuitAuthError>
     where
-        E: AuthExtract<Request = R>,
+        E: AuthExtract<R>,
     {
-        let auth_info_guard: arc_swap::Guard<_, _> = self.auth_info.load();
-        let auth_info: &AuthConfig = &auth_info_guard;
+        let auth_config_guard: arc_swap::Guard<_, _> = self.auth_config.load();
+        let auth_config: &AuthConfig = &auth_config_guard;
 
         // We play some weird error-handling games here so that we don't
         // accidentally emit sensitive information in errors, which are
         // likely to end up in logs somewhere.
+
         let try_auth = || -> Result<(), BiscuitAuthError> {
-            let biscuit = auth_info.biscuit(&extractor.auth_token(request)?)?;
+            let biscuit = &extractor.auth_token(request, auth_config)?;
 
-            let mut authorizer = auth_info.authorizer.clone();
+            let mut authorizer = auth_config.authorizer.clone();
+
             authorizer.add_token(&biscuit)?;
-
-            extractor.extract_context(request, &mut authorizer)?;
+            extractor.extract_context(request, auth_config, &mut authorizer)?;
 
             authorizer.authorize()?;
 
             Ok(())
         };
 
-        try_auth().map_err(|err| match auth_info.error_mode {
+        try_auth().map_err(|err| match auth_config.error_mode {
             ErrorMode::Secure => BiscuitAuthError::Unknown,
             ErrorMode::Verbose => err,
         })
     }
 }
 
-type TowerError = tower::BoxError;
+#[derive(Clone, Debug)]
+pub struct AuthPredicate<E> {
+    shared_auth: SharedAuth,
+    extractor: E,
+}
 
-impl<Request, Extract> tower::filter::Predicate<Request> for BiscuitAuth<Extract>
+impl<Request, Extract> tower::filter::Predicate<Request> for AuthPredicate<Extract>
 where
-    Extract: AuthExtract<Request = Request>,
+    Extract: AuthExtract<Request>,
 {
     type Request = Request;
 
     fn check(&mut self, request: Request) -> Result<Self::Request, TowerError> {
-        BiscuitAuth::check(self, &request, &self.extractor)?;
+        self.shared_auth.check(&request, &self.extractor)?;
         Ok(request)
     }
 }
@@ -74,8 +96,18 @@ where
 #[derive(Debug)]
 pub enum BiscuitAuthError {
     Unknown,
+    MissingBiscuit,
     Other(tower::BoxError),
     Failure(Token),
+}
+
+impl BiscuitAuthError {
+    pub fn auth_error(&self) -> Option<&Token> {
+        match self {
+            Self::Failure(token) => Some(token),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for BiscuitAuthError {
@@ -86,6 +118,7 @@ impl fmt::Display for BiscuitAuthError {
                 f.write_str("other error: ")?;
                 err.fmt(f)
             }
+            BiscuitAuthError::MissingBiscuit => f.write_str("missing biscuit"),
             BiscuitAuthError::Failure(err_token) => {
                 f.write_str("verification failure: ")?;
                 err_token.fmt(f)
@@ -108,20 +141,19 @@ pub enum ErrorMode {
     Verbose,
 }
 
-pub trait AuthExtract {
-    type Request;
-
+pub trait AuthExtract<Request> {
     /// How to find the
-    fn auth_token(&self, req: &Self::Request) -> Result<Vec<u8>, BiscuitAuthError>;
+    fn auth_token(&self, req: &Request, config: &AuthConfig) -> Result<Biscuit, BiscuitAuthError>;
 
     /// Use the information in the request to add any relevant infoformation
     /// to the authorizer, such as if the request is a read or write request,
     /// or the specific resource the request is trying to access.
     fn extract_context(
         &self,
-        _req: &Self::Request,
+        _req: &Request,
+        _config: &AuthConfig,
         _authorizer: &mut Authorizer,
-    ) -> Result<(), Token> {
+    ) -> Result<(), BiscuitAuthError> {
         Ok(())
     }
 }
@@ -159,11 +191,11 @@ impl AuthConfig {
         }
     }
 
-    fn biscuit(&self, token: &[u8]) -> Result<Biscuit, Token> {
-        Biscuit::from(token, |id| self.pubkey_by_id(id))
+    pub fn biscuit(&self, token: &[u8]) -> Result<Biscuit, BiscuitAuthError> {
+        Biscuit::from(token, |id| self.pubkey_by_id(id)).map_err(BiscuitAuthError::from)
     }
 
-    fn pubkey_by_id(&self, id: Option<u32>) -> PublicKey {
+    pub fn pubkey_by_id(&self, id: Option<u32>) -> PublicKey {
         match id {
             None => self.root_pubkeys.base,
             Some(id) => self
